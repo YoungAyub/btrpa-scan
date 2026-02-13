@@ -13,7 +13,12 @@ A Bluetooth Low Energy (BLE) scanner with advanced Resolvable Private Address (R
 - **RSSI Filtering** - Filter out weak signals with a minimum RSSI threshold
 - **RSSI Averaging** - Sliding window average smooths noisy BLE RSSI readings for more stable distance estimates
 - **Active Scanning** - Send SCAN_REQ to get SCAN_RSP with additional service UUIDs and device names that passive scanning misses
-- **CSV/JSON Export** - Export scan results to CSV or JSON files for further analysis
+- **Environment Presets** - Indoor, outdoor, and free-space path-loss models for more accurate distance estimation
+- **Proximity Alerts** - Audible/visual alert when a device is estimated within a configurable distance
+- **Live TUI** - Curses-based live-updating table sorted by signal strength
+- **Real-Time CSV Log** - Stream each detection to a CSV file as it happens
+- **Batch Export** - Export results to CSV, JSON, or JSONL at end of scan
+- **Multi-Adapter** - Scan with multiple Bluetooth adapters simultaneously (Linux)
 - **Verbose/Quiet Modes** - Verbose mode shows additional details (e.g. non-matching RPAs in IRK mode); quiet mode suppresses per-device output and shows only the summary
 
 ## Requirements
@@ -28,7 +33,7 @@ A Bluetooth Low Energy (BLE) scanner with advanced Resolvable Private Address (R
 |----------|-------|
 | **macOS** | Uses CoreBluetooth. IRK mode leverages an undocumented API to retrieve real Bluetooth addresses instead of UUIDs. |
 | **Linux** | May require `root` or `CAP_NET_ADMIN` capability for scanning. |
-| **Windows** | Native WinRT Bluetooth API — real MAC addresses available natively. |
+| **Windows** | Native WinRT Bluetooth API — real MAC addresses available natively. TUI requires `pip install windows-curses`. |
 
 ## Installation
 
@@ -41,9 +46,12 @@ pip install -r requirements.txt
 ## Usage
 
 ```
-usage: btrpa-scan.py [-h] [-a] [--irk HEX] [-t TIMEOUT] [--output {csv,json}]
-                     [-o FILE] [-v | -q] [--min-rssi DBM] [--rssi-window N]
-                     [--active] [mac]
+usage: btrpa-scan.py [-h] [-a] [--irk HEX] [-t TIMEOUT]
+                     [--output {csv,json,jsonl}] [-o FILE] [--log FILE]
+                     [-v | -q] [--min-rssi DBM] [--rssi-window N] [--active]
+                     [--environment {free_space,indoor,outdoor}]
+                     [--alert-within METERS] [--tui] [--adapters LIST]
+                     [mac]
 
 BLE Scanner — discover all devices or hunt for a specific one
 
@@ -55,14 +63,21 @@ optional arguments:
   -a, --all             Scan for all broadcasting devices
   --irk HEX             Resolve RPAs using this Identity Resolving Key (32 hex chars)
   -t, --timeout TIMEOUT Scan timeout in seconds (default: 30, or infinite for --irk)
-  --output {csv,json}   Output format (csv or json)
+  --output {csv,json,jsonl}
+                        Batch output format written at end of scan
   -o, --output-file FILE
                         Output file path (default: btrpa-scan-results.<format>)
+  --log FILE            Stream detections to a CSV file in real time
   -v, --verbose         Verbose mode — show additional details
   -q, --quiet           Quiet mode — suppress per-device output, show summary only
   --min-rssi DBM        Minimum RSSI threshold (e.g. -70) — ignore weaker signals
   --rssi-window N       RSSI sliding window size for averaging (default: 1 = no averaging)
   --active              Use active scanning (sends SCAN_REQ for additional data)
+  --environment {free_space,indoor,outdoor}
+                        Distance estimation path-loss model (default: free_space)
+  --alert-within METERS Proximity alert when device is within this distance
+  --tui                 Live-updating terminal table instead of scrolling output
+  --adapters LIST       Comma-separated Bluetooth adapter names (e.g. hci0,hci1)
 ```
 
 ### Mode 1: Discover All Devices
@@ -132,23 +147,96 @@ python3 btrpa-scan.py --all --active
 
 > **Note:** On macOS, CoreBluetooth always scans actively regardless of this flag. On Linux/BlueZ, active scanning may require root or `CAP_NET_ADMIN`.
 
-### Exporting Results
+### Environment Presets
 
-Export results to JSON:
+Distance estimation uses a path-loss exponent that varies by environment. The default (`free_space`, n=2.0) assumes no obstructions. For more realistic estimates indoors:
+
+```bash
+python3 btrpa-scan.py --all --environment indoor
+```
+
+| Preset | Path-Loss Exponent (n) | Use Case |
+|--------|------------------------|----------|
+| `free_space` | 2.0 | Open air, line of sight |
+| `outdoor` | 2.2 | Parks, parking lots |
+| `indoor` | 3.0 | Offices, homes, buildings |
+
+Higher `n` values produce larger distance estimates for the same RSSI, reflecting signal attenuation from walls and obstacles.
+
+### Proximity Alerts
+
+Trigger an audible bell and visual alert when a device is estimated within a given distance. Requires that the target device advertise TX Power:
+
+```bash
+python3 btrpa-scan.py AA:BB:CC:DD:EE:FF --alert-within 5.0
+```
+
+Works in all modes including IRK resolution:
+
+```bash
+python3 btrpa-scan.py --irk <key> --alert-within 3.0
+```
+
+### Live TUI
+
+Replace scrolling output with a live-updating terminal table, sorted by signal strength:
+
+```bash
+python3 btrpa-scan.py --all --tui
+```
+
+The TUI shows all detected devices in a compact table with address, name, RSSI, averaged RSSI, estimated distance, detection count, and last-seen time. Resolved IRK matches are shown in bold, and devices within the `--alert-within` threshold are highlighted.
+
+Combine with other flags:
+
+```bash
+python3 btrpa-scan.py --irk <key> --tui --rssi-window 5 --environment indoor --alert-within 5.0
+```
+
+### Real-Time CSV Log
+
+Stream each detection to a CSV file as it happens (useful for long-running scans where you want incremental data):
+
+```bash
+python3 btrpa-scan.py --all --log scan.csv
+```
+
+This can be combined with `--output` for a separate batch export:
+
+```bash
+python3 btrpa-scan.py --all --log live.csv --output json -o results.json
+```
+
+### Batch Export
+
+Export all results at end of scan in CSV, JSON, or JSONL (JSON Lines) format:
 
 ```bash
 python3 btrpa-scan.py --all --output json -o results.json -t 30
+python3 btrpa-scan.py --all --output csv -t 30
+python3 btrpa-scan.py --all --output jsonl -o results.jsonl -t 30
 ```
 
-Export results to CSV (uses default filename `btrpa-scan-results.csv`):
+JSONL writes one JSON object per line, making it easy to pipe through `jq`:
 
 ```bash
-python3 btrpa-scan.py --all --output csv -t 30
+python3 btrpa-scan.py --all --output jsonl -o results.jsonl -t 10
+cat results.jsonl | jq .
 ```
+
+### Multi-Adapter Scanning (Linux)
+
+Scan with multiple Bluetooth adapters simultaneously for wider coverage:
+
+```bash
+python3 btrpa-scan.py --all --adapters hci0,hci1
+```
+
+Each adapter runs its own scanner instance sharing the same detection callback. All detections are merged into a single output.
 
 ### Quiet and Verbose Modes
 
-Run in quiet mode (summary only, no per-device output — useful with `--output`):
+Run in quiet mode (summary only, no per-device output — useful with `--output` or `--log`):
 
 ```bash
 python3 btrpa-scan.py --all -q --output json -t 30
@@ -174,6 +262,7 @@ btrpa-scan implements the `ah()` function from the Bluetooth Core Specification 
 
 ```
 Mode: DISCOVER ALL - showing every broadcasting device
+Scanning: passive
 Timeout: 30s  |  Press Ctrl+C to stop
 ------------------------------------------------------------
 

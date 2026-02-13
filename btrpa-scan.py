@@ -41,6 +41,25 @@ except ImportError:
     print("Install dependencies with:  pip install -r requirements.txt")
     sys.exit(1)
 
+_HAS_CURSES = False
+try:
+    import curses
+    _HAS_CURSES = True
+except ImportError:
+    pass
+
+# Environment path loss exponents for distance estimation
+_ENV_PATH_LOSS = {
+    "free_space": 2.0,
+    "outdoor": 2.2,
+    "indoor": 3.0,
+}
+
+_FIELDNAMES = [
+    "timestamp", "address", "name", "rssi", "avg_rssi", "tx_power",
+    "est_distance", "manufacturer_data", "service_uuids", "resolved",
+]
+
 
 class BLEScanner:
     def __init__(self, target_mac: Optional[str], timeout: float,
@@ -51,7 +70,12 @@ class BLEScanner:
                  quiet: bool = False,
                  min_rssi: Optional[int] = None,
                  rssi_window: int = 1,
-                 active: bool = False):
+                 active: bool = False,
+                 environment: str = "free_space",
+                 alert_within: Optional[float] = None,
+                 log_file: Optional[str] = None,
+                 tui: bool = False,
+                 adapters: Optional[List[str]] = None):
         self.target_mac = target_mac.upper() if target_mac else None
         self.targeted = target_mac is not None
         self.timeout = timeout
@@ -61,10 +85,10 @@ class BLEScanner:
         # IRK mode
         self.irk = irk
         self.irk_mode = irk is not None
-        self.resolved_devices: Dict[str, int] = {}  # addr -> detection count
+        self.resolved_devices: Dict[str, int] = {}
         self.rpa_count = 0
         self.non_rpa_warned: set = set()
-        # New options
+        # Options
         self.verbose = verbose
         self.quiet = quiet
         self.min_rssi = min_rssi
@@ -76,6 +100,21 @@ class BLEScanner:
         self.rssi_history: Dict[str, deque] = {}
         # Scanning mode
         self.active = active
+        # Environment for distance estimation
+        self.environment = environment
+        # Proximity alerts
+        self.alert_within = alert_within
+        # Real-time CSV log
+        self.log_file = log_file
+        self._log_writer = None
+        self._log_fh = None
+        # TUI mode
+        self.tui = tui
+        self.tui_devices: Dict[str, dict] = {}
+        self._tui_screen = None
+        self._tui_start = 0.0
+        # Multi-adapter
+        self.adapters = adapters
 
     def _avg_rssi(self, addr: str, rssi: int) -> int:
         """Update RSSI sliding window for a device and return the average."""
@@ -84,13 +123,14 @@ class BLEScanner:
         self.rssi_history[addr].append(rssi)
         return round(sum(self.rssi_history[addr]) / len(self.rssi_history[addr]))
 
-    def _record_device(self, device: BLEDevice, adv: AdvertisementData,
-                       resolved: Optional[bool] = None, avg_rssi: Optional[int] = None):
-        """Build a record dict from device/adv data and append to self.records."""
+    def _build_record(self, device: BLEDevice, adv: AdvertisementData,
+                      resolved: Optional[bool] = None,
+                      avg_rssi: Optional[int] = None) -> dict:
+        """Build a record dict from device/adv data."""
         rssi = adv.rssi
         tx_power = adv.tx_power
         rssi_for_dist = avg_rssi if avg_rssi is not None else rssi
-        dist = _estimate_distance(rssi_for_dist, tx_power)
+        dist = _estimate_distance(rssi_for_dist, tx_power, self.environment)
 
         mfr_data = ""
         if adv.manufacturer_data:
@@ -101,32 +141,68 @@ class BLEScanner:
 
         service_uuids = ", ".join(adv.service_uuids) if adv.service_uuids else ""
 
-        record = {
+        return {
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
             "address": device.address,
             "name": device.name or "Unknown",
             "rssi": rssi,
+            "avg_rssi": avg_rssi if avg_rssi is not None else "",
             "tx_power": tx_power if tx_power is not None else "",
             "est_distance": round(dist, 2) if dist is not None else "",
             "manufacturer_data": mfr_data,
             "service_uuids": service_uuids,
-            "avg_rssi": avg_rssi if avg_rssi is not None else "",
             "resolved": resolved if resolved is not None else "",
         }
+
+    def _record_device(self, device: BLEDevice, adv: AdvertisementData,
+                       resolved: Optional[bool] = None,
+                       avg_rssi: Optional[int] = None):
+        """Build a record, append to self.records, write to live log, update TUI state."""
+        record = self._build_record(device, adv, resolved=resolved, avg_rssi=avg_rssi)
         self.records.append(record)
 
-    def _print_device(self, device: BLEDevice, adv: AdvertisementData, label: str,
-                      resolved: Optional[bool] = None, avg_rssi: Optional[int] = None):
-        # Always record for output file
+        # Real-time CSV logging
+        if self._log_writer is not None:
+            self._log_writer.writerow(record)
+            self._log_fh.flush()
+
+        # Update TUI device state
+        if self.tui:
+            addr = (device.address or "").upper()
+            self.tui_devices[addr] = {
+                "address": device.address,
+                "name": device.name or "Unknown",
+                "rssi": adv.rssi,
+                "avg_rssi": avg_rssi,
+                "est_distance": record["est_distance"],
+                "times_seen": self.unique_devices.get(addr, 0),
+                "last_seen": time.strftime("%H:%M:%S"),
+                "resolved": resolved,
+            }
+
+        # Proximity alert
+        if self.alert_within is not None and record["est_distance"] != "":
+            if record["est_distance"] <= self.alert_within:
+                if self.tui and self._tui_screen is not None:
+                    curses.beep()
+                elif not self.quiet:
+                    print(f"\a  ** PROXIMITY ALERT ** {device.address} "
+                          f"within ~{record['est_distance']:.1f}m "
+                          f"(threshold: {self.alert_within}m)")
+
+    def _print_device(self, device: BLEDevice, adv: AdvertisementData,
+                      label: str, resolved: Optional[bool] = None,
+                      avg_rssi: Optional[int] = None):
+        # Always record for output / log / TUI
         self._record_device(device, adv, resolved=resolved, avg_rssi=avg_rssi)
 
-        if self.quiet:
+        if self.quiet or self.tui:
             return
 
         rssi = adv.rssi
         tx_power = adv.tx_power
         rssi_for_dist = avg_rssi if avg_rssi is not None else rssi
-        dist = _estimate_distance(rssi_for_dist, tx_power)
+        dist = _estimate_distance(rssi_for_dist, tx_power, self.environment)
 
         print(f"\n{'='*60}")
         print(f"  {label}")
@@ -182,35 +258,33 @@ class BLEScanner:
             if self.target_mac not in addr:
                 return
             self.seen_count += 1
-            self._print_device(device, adv, f"TARGET FOUND  —  detection #{self.seen_count}",
+            self._print_device(device, adv,
+                               f"TARGET FOUND  —  detection #{self.seen_count}",
                                avg_rssi=avg_rssi)
         else:
             times_seen = self.unique_devices.get(addr, 0) + 1
             self.unique_devices[addr] = times_seen
             self.seen_count += 1
-            self._print_device(device, adv, f"DEVICE #{len(self.unique_devices)}  —  seen {times_seen}x",
+            self._print_device(device, adv,
+                               f"DEVICE #{len(self.unique_devices)}  —  seen {times_seen}x",
                                avg_rssi=avg_rssi)
 
-    def _irk_detection(self, device: BLEDevice, adv: AdvertisementData, addr: str,
-                       avg_rssi: Optional[int] = None):
+    def _irk_detection(self, device: BLEDevice, adv: AdvertisementData,
+                       addr: str, avg_rssi: Optional[int] = None):
         """Handle a detection in IRK resolution mode."""
         self.seen_count += 1
 
-        # CoreBluetooth UUIDs look like 8-4-4-4-12 hex (no colons in MAC sense)
-        # Real MACs are XX:XX:XX:XX:XX:XX (6 colon-separated octets)
         is_uuid = len(addr.replace("-", "")) == 32 and ":" not in addr
         if is_uuid:
             if addr not in self.non_rpa_warned:
                 self.non_rpa_warned.add(addr)
-                if not self.quiet:
+                if not self.quiet and not self.tui:
                     print(f"  [!] UUID address {addr} — cannot resolve (need real MAC)")
             return
 
-        # Track unique devices
         times_seen = self.unique_devices.get(addr, 0) + 1
         self.unique_devices[addr] = times_seen
 
-        # Try to resolve
         resolved = _resolve_rpa(self.irk, addr)
 
         if resolved:
@@ -230,35 +304,131 @@ class BLEScanner:
                     resolved=False, avg_rssi=avg_rssi,
                 )
 
-    async def scan(self):
-        if not self.quiet:
+    # ------------------------------------------------------------------
+    # TUI (curses)
+    # ------------------------------------------------------------------
+
+    def _redraw_tui(self, screen):
+        """Redraw the TUI live table."""
+        try:
+            screen.erase()
+            h, w = screen.getmaxyx()
+
+            elapsed = time.time() - self._tui_start
+            header = (f" btrpa-scan | Devices: {len(self.tui_devices)}"
+                      f"  Detections: {self.seen_count}"
+                      f"  Elapsed: {elapsed:.0f}s")
             if self.irk_mode:
-                print("Mode: IRK RESOLUTION — resolving RPAs against provided IRK")
-                print(f"  IRK: {self.irk.hex()}")
-                _os = platform.system()
-                if _os == "Darwin":
-                    print("  Note: using undocumented macOS API to retrieve real BT addresses")
-                elif _os == "Linux":
-                    print("  Note: Linux/BlueZ — may require root or CAP_NET_ADMIN")
-                elif _os == "Windows":
-                    print("  Note: Windows/WinRT — real MAC addresses available natively")
-            elif self.targeted:
-                print(f"Mode: TARGETED — searching for {self.target_mac}")
-            else:
-                print("Mode: DISCOVER ALL — showing every broadcasting device")
-            scan_mode = "active" if self.active else "passive"
-            print(f"Scanning: {scan_mode}", end="")
+                header += f"  IRK matches: {self.rpa_count}"
+            screen.addnstr(0, 0, header.ljust(w - 1), w - 1,
+                           curses.A_BOLD | curses.A_REVERSE)
+
+            settings = f" {'active' if self.active else 'passive'}"
+            if self.environment != "free_space":
+                settings += f" | env: {self.environment}"
             if self.rssi_window > 1:
-                print(f"  |  RSSI averaging: window of {self.rssi_window}")
-            else:
-                print()
+                settings += f" | rssi-avg: {self.rssi_window}"
             if self.min_rssi is not None:
-                print(f"Min RSSI: {self.min_rssi} dBm")
-            if self.timeout == float('inf'):
-                print("Running continuously  |  Press Ctrl+C to stop")
-            else:
-                print(f"Timeout: {self.timeout}s  |  Press Ctrl+C to stop")
-            print(f"{'—'*60}")
+                settings += f" | min-rssi: {self.min_rssi}"
+            if self.alert_within is not None:
+                settings += f" | alert: <{self.alert_within}m"
+            screen.addnstr(1, 0, settings, w - 1, curses.A_DIM)
+
+            col_fmt = " {:<19s} {:<16s} {:>5s} {:>5s} {:>7s} {:>5s} {:>8s}"
+            col_hdr = col_fmt.format(
+                "Address", "Name", "RSSI", "Avg", "Dist", "Seen", "Last")
+            screen.addnstr(3, 0, col_hdr, w - 1, curses.A_UNDERLINE)
+
+            sorted_devs = sorted(
+                self.tui_devices.values(),
+                key=lambda d: d["rssi"], reverse=True,
+            )
+
+            row = 4
+            for dev in sorted_devs:
+                if row >= h - 1:
+                    remaining = len(sorted_devs) - (row - 4)
+                    screen.addnstr(
+                        h - 1, 0,
+                        f" ... {remaining} more (resize terminal)", w - 1)
+                    break
+                avg_str = str(dev["avg_rssi"]) if dev["avg_rssi"] is not None else ""
+                dist_str = (f"~{dev['est_distance']:.1f}m"
+                            if dev["est_distance"] != "" else "")
+                line = col_fmt.format(
+                    (dev["address"] or "")[:18],
+                    dev["name"][:15],
+                    str(dev["rssi"]), avg_str, dist_str,
+                    f"{dev['times_seen']}x",
+                    dev["last_seen"],
+                )
+                attr = curses.A_NORMAL
+                if dev.get("resolved") is True:
+                    attr = curses.A_BOLD
+                if (self.alert_within is not None
+                        and dev["est_distance"] != ""
+                        and dev["est_distance"] <= self.alert_within):
+                    attr |= curses.A_STANDOUT
+                screen.addnstr(row, 0, line, w - 1, attr)
+                row += 1
+
+            footer = " Press Ctrl+C to stop"
+            if self.log_file:
+                footer += f"  |  Logging to {self.log_file}"
+            screen.addnstr(h - 1, 0, footer, w - 1, curses.A_DIM)
+
+            screen.refresh()
+        except curses.error:
+            pass
+
+    # ------------------------------------------------------------------
+    # Main scan flow
+    # ------------------------------------------------------------------
+
+    async def scan(self):
+        # Open real-time CSV log
+        if self.log_file:
+            self._log_fh = open(self.log_file, "w", newline="")
+            self._log_writer = csv.DictWriter(self._log_fh,
+                                              fieldnames=_FIELDNAMES)
+            self._log_writer.writeheader()
+            self._log_fh.flush()
+
+        # TUI setup
+        if self.tui:
+            self._tui_screen = curses.initscr()
+            curses.noecho()
+            curses.cbreak()
+            curses.curs_set(0)
+            if curses.has_colors():
+                curses.start_color()
+                curses.use_default_colors()
+
+        try:
+            elapsed = await self._scan_loop()
+        finally:
+            # TUI cleanup
+            if self._tui_screen is not None:
+                curses.curs_set(1)
+                curses.nocbreak()
+                curses.echo()
+                curses.endwin()
+                self._tui_screen = None
+
+            # Close log file
+            if self._log_fh is not None:
+                self._log_fh.close()
+                self._log_fh = None
+                self._log_writer = None
+
+        # Summary and output (printed after TUI is torn down)
+        self._print_summary(elapsed)
+        self._write_output()
+
+    async def _scan_loop(self) -> float:
+        """Run the BLE scanner and return elapsed seconds."""
+        if not self.quiet and not self.tui:
+            self._print_header()
 
         scanner_kwargs: dict = {"detection_callback": self.detection_callback}
         if self.active:
@@ -266,29 +436,87 @@ class BLEScanner:
         if self.irk_mode and platform.system() == "Darwin":
             scanner_kwargs["cb"] = {"use_bdaddr": True}
 
-        scanner = BleakScanner(**scanner_kwargs)
-        await scanner.start()
+        # Multi-adapter support
+        scanners = []
+        if self.adapters:
+            for adapter in self.adapters:
+                kw = {**scanner_kwargs, "adapter": adapter}
+                scanners.append(BleakScanner(**kw))
+        else:
+            scanners.append(BleakScanner(**scanner_kwargs))
+
+        for s in scanners:
+            await s.start()
 
         start = time.time()
+        self._tui_start = start
         try:
             if self.timeout == float('inf'):
                 while self.running:
-                    await asyncio.sleep(0.5)
+                    if self._tui_screen is not None:
+                        self._redraw_tui(self._tui_screen)
+                    await asyncio.sleep(0.3 if self.tui else 0.5)
             else:
                 while self.running and (time.time() - start) < self.timeout:
+                    if self._tui_screen is not None:
+                        self._redraw_tui(self._tui_screen)
                     await asyncio.sleep(0.1)
         except asyncio.CancelledError:
             pass
         finally:
-            await scanner.stop()
+            for s in scanners:
+                await s.stop()
 
-        elapsed = time.time() - start
+        return time.time() - start
+
+    def _print_header(self):
+        """Print scan configuration banner."""
+        if self.irk_mode:
+            print("Mode: IRK RESOLUTION — resolving RPAs against provided IRK")
+            print(f"  IRK: {self.irk.hex()}")
+            _os = platform.system()
+            if _os == "Darwin":
+                print("  Note: using undocumented macOS API to retrieve real BT addresses")
+            elif _os == "Linux":
+                print("  Note: Linux/BlueZ — may require root or CAP_NET_ADMIN")
+            elif _os == "Windows":
+                print("  Note: Windows/WinRT — real MAC addresses available natively")
+        elif self.targeted:
+            print(f"Mode: TARGETED — searching for {self.target_mac}")
+        else:
+            print("Mode: DISCOVER ALL — showing every broadcasting device")
+        scan_mode = "active" if self.active else "passive"
+        print(f"Scanning: {scan_mode}", end="")
+        if self.rssi_window > 1:
+            print(f"  |  RSSI averaging: window of {self.rssi_window}")
+        else:
+            print()
+        if self.environment != "free_space":
+            print(f"Environment: {self.environment} "
+                  f"(n={_ENV_PATH_LOSS[self.environment]})")
+        if self.min_rssi is not None:
+            print(f"Min RSSI: {self.min_rssi} dBm")
+        if self.alert_within is not None:
+            print(f"Proximity alert: within {self.alert_within}m")
+        if self.log_file:
+            print(f"Live log: {self.log_file}")
+        if self.adapters:
+            print(f"Adapters: {', '.join(self.adapters)}")
+        if self.timeout == float('inf'):
+            print("Running continuously  |  Press Ctrl+C to stop")
+        else:
+            print(f"Timeout: {self.timeout}s  |  Press Ctrl+C to stop")
+        print(f"{'—'*60}")
+
+    def _print_summary(self, elapsed: float):
+        """Print scan summary statistics."""
         print(f"\n{'—'*60}")
         print(f"Scan complete — {elapsed:.1f}s elapsed")
         print(f"  Total detections : {self.seen_count}")
         if self.irk_mode:
             print(f"  Unique addresses : {len(self.unique_devices)}")
-            print(f"  IRK matches      : {self.rpa_count} detections across {len(self.resolved_devices)} address(es)")
+            print(f"  IRK matches      : {self.rpa_count} detections "
+                  f"across {len(self.resolved_devices)} address(es)")
             if self.resolved_devices:
                 print(f"\n  Resolved addresses:")
                 print(f"  {'Address':<20} {'Detections':>11}")
@@ -297,51 +525,61 @@ class BLEScanner:
                                           key=lambda x: x[1], reverse=True):
                     print(f"  {addr:<20} {count:>10}x")
             if not self.resolved_devices:
-                print("\n  No addresses resolved — the device may not be broadcasting,")
+                print("\n  No addresses resolved — the device may not be "
+                      "broadcasting,")
                 print("  or the IRK may be incorrect.")
         elif not self.targeted:
             print(f"  Unique devices   : {len(self.unique_devices)}")
             if self.unique_devices:
                 print(f"\n  {'Address':<40} {'Seen':>6}")
                 print(f"  {'—'*40} {'—'*6}")
-                for addr, count in sorted(self.unique_devices.items(), key=lambda x: x[1], reverse=True):
+                for addr, count in sorted(self.unique_devices.items(),
+                                          key=lambda x: x[1], reverse=True):
                     print(f"  {addr:<40} {count:>5}x")
 
-        # Write output file
-        if self.output_format and self.records:
-            filename = self.output_file or f"btrpa-scan-results.{self.output_format}"
-            fieldnames = [
-                "timestamp", "address", "name", "rssi", "avg_rssi", "tx_power",
-                "est_distance", "manufacturer_data", "service_uuids", "resolved",
-            ]
-            if self.output_format == "json":
-                with open(filename, "w") as f:
-                    json.dump(self.records, f, indent=2)
-            elif self.output_format == "csv":
-                with open(filename, "w", newline="") as f:
-                    writer = csv.DictWriter(f, fieldnames=fieldnames)
-                    writer.writeheader()
-                    writer.writerows(self.records)
-            print(f"  Results written to {filename}")
+    def _write_output(self):
+        """Write batch output file (json / jsonl / csv)."""
+        if not self.output_format or not self.records:
+            if self.log_file:
+                print(f"  Live log written to {self.log_file}")
+            return
+
+        filename = self.output_file or f"btrpa-scan-results.{self.output_format}"
+        if self.output_format == "json":
+            with open(filename, "w") as f:
+                json.dump(self.records, f, indent=2)
+        elif self.output_format == "jsonl":
+            with open(filename, "w") as f:
+                for record in self.records:
+                    f.write(json.dumps(record) + "\n")
+        elif self.output_format == "csv":
+            with open(filename, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=_FIELDNAMES)
+                writer.writeheader()
+                writer.writerows(self.records)
+        print(f"  Results written to {filename}")
+        if self.log_file:
+            print(f"  Live log written to {self.log_file}")
 
     def stop(self):
         self.running = False
 
 
-def _estimate_distance(rssi: int, tx_power: Optional[int]) -> Optional[float]:
+def _estimate_distance(rssi: int, tx_power: Optional[int],
+                       env: str = "free_space") -> Optional[float]:
     """Estimate distance in meters using the log-distance path loss model."""
     if tx_power is None:
         return None
     if rssi == 0:
         return None
-    n = 2.0
+    n = _ENV_PATH_LOSS.get(env, 2.0)
     return 10 ** ((tx_power - rssi) / (10 * n))
 
 
 def _bt_ah(irk: bytes, prand: bytes) -> bytes:
     """Bluetooth Core Spec ah() function (Vol 3, Part H, Section 2.2.2).
 
-    AES-128-ECB(IRK, padding || prand) → return last 3 bytes.
+    AES-128-ECB(IRK, padding || prand) -> return last 3 bytes.
     """
     plaintext = b'\x00' * 13 + prand  # 16 bytes: 13 zero-pad + 3-byte prand
     cipher = Cipher(algorithms.AES(irk), modes.ECB())
@@ -389,7 +627,8 @@ def _parse_irk(irk_string: str) -> bytes:
         s = s[2:]
     s = s.replace(":", "").replace("-", "")
     if len(s) != 32:
-        raise ValueError(f"IRK must be exactly 16 bytes (32 hex chars), got {len(s)} hex chars")
+        raise ValueError(
+            f"IRK must be exactly 16 bytes (32 hex chars), got {len(s)} hex chars")
     try:
         return bytes.fromhex(s)
     except ValueError:
@@ -404,88 +643,105 @@ def main():
         description="BLE Scanner — discover all devices or hunt for a specific one"
     )
     parser.add_argument(
-        "mac",
-        nargs="?",
-        default=None,
+        "mac", nargs="?", default=None,
         help="Target MAC address to search for (omit to scan all)"
     )
     parser.add_argument(
-        "-a", "--all",
-        action="store_true",
+        "-a", "--all", action="store_true",
         help="Scan for all broadcasting devices"
     )
     parser.add_argument(
-        "--irk",
-        type=str,
-        default=None,
-        metavar="HEX",
+        "--irk", type=str, default=None, metavar="HEX",
         help="Resolve RPAs using this Identity Resolving Key (32 hex chars)"
     )
     parser.add_argument(
-        "-t", "--timeout",
-        type=float,
-        default=None,
+        "-t", "--timeout", type=float, default=None,
         help="Scan timeout in seconds (default: 30, or infinite for --irk)"
     )
+
+    # Output / logging
     parser.add_argument(
-        "--output",
-        choices=["csv", "json"],
-        default=None,
-        help="Output format (csv or json)"
+        "--output", choices=["csv", "json", "jsonl"], default=None,
+        help="Batch output format written at end of scan"
     )
     parser.add_argument(
-        "-o", "--output-file",
-        type=str,
-        default=None,
-        metavar="FILE",
+        "-o", "--output-file", type=str, default=None, metavar="FILE",
         help="Output file path (default: btrpa-scan-results.<format>)"
     )
+    parser.add_argument(
+        "--log", type=str, default=None, metavar="FILE",
+        help="Stream detections to a CSV file in real time"
+    )
+
+    # Verbosity
     verbosity = parser.add_mutually_exclusive_group()
     verbosity.add_argument(
-        "-v", "--verbose",
-        action="store_true",
+        "-v", "--verbose", action="store_true",
         help="Verbose mode — show additional details"
     )
     verbosity.add_argument(
-        "-q", "--quiet",
-        action="store_true",
+        "-q", "--quiet", action="store_true",
         help="Quiet mode — suppress per-device output, show summary only"
     )
+
+    # Signal / detection tuning
     parser.add_argument(
-        "--min-rssi",
-        type=int,
-        default=None,
-        metavar="DBM",
+        "--min-rssi", type=int, default=None, metavar="DBM",
         help="Minimum RSSI threshold (e.g. -70) — ignore weaker signals"
     )
     parser.add_argument(
-        "--rssi-window",
-        type=int,
-        default=1,
-        metavar="N",
-        help="RSSI sliding window size for averaging (e.g. 5–10). "
-             "Smooths noisy readings for more stable distance estimates (default: 1 = no averaging)"
+        "--rssi-window", type=int, default=1, metavar="N",
+        help="RSSI sliding window size for averaging (e.g. 5-10). "
+             "Smooths noisy readings for stable distance estimates "
+             "(default: 1 = no averaging)"
     )
     parser.add_argument(
-        "--active",
-        action="store_true",
+        "--active", action="store_true",
         help="Use active scanning — sends SCAN_REQ to get SCAN_RSP with "
              "additional service UUIDs and names (default: passive)"
     )
+    parser.add_argument(
+        "--environment", choices=["free_space", "indoor", "outdoor"],
+        default="free_space",
+        help="Environment preset for distance estimation path-loss exponent: "
+             "free_space (n=2.0), outdoor (n=2.2), indoor (n=3.0). "
+             "Default: free_space"
+    )
+
+    # Proximity alerts
+    parser.add_argument(
+        "--alert-within", type=float, default=None, metavar="METERS",
+        help="Trigger an audible/visual alert when a device is estimated "
+             "within this distance (requires TX Power in advertisements)"
+    )
+
+    # TUI
+    parser.add_argument(
+        "--tui", action="store_true",
+        help="Live-updating terminal table instead of scrolling output"
+    )
+
+    # Multi-adapter (Linux)
+    parser.add_argument(
+        "--adapters", type=str, default=None, metavar="LIST",
+        help="Comma-separated Bluetooth adapter names to scan with "
+             "(e.g. hci0,hci1 — Linux only)"
+    )
+
     args = parser.parse_args()
 
-    # Validate --output-file requires --output
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
     if args.output_file and not args.output:
-        parser.error("--output-file (-o) requires --output to specify the format (csv or json)")
+        parser.error("--output-file (-o) requires --output to specify "
+                     "the format (csv, json, or jsonl)")
 
-    # MAC address validation
     if args.mac and not _MAC_RE.match(args.mac):
         parser.error(
             f"Invalid MAC address '{args.mac}'. "
-            "Expected format: XX:XX:XX:XX:XX:XX (6 colon-separated hex octets)"
-        )
+            "Expected format: XX:XX:XX:XX:XX:XX (6 colon-separated hex octets)")
 
-    # Mutual exclusivity
     if args.irk and args.all:
         parser.error("Cannot use --irk with --all")
     if args.irk and args.mac:
@@ -496,11 +752,17 @@ def main():
         parser.print_help()
         sys.exit(0)
 
-    # Validate RSSI window
     if args.rssi_window < 1:
         parser.error("--rssi-window must be at least 1")
 
-    # Parse and validate IRK
+    if args.tui and not _HAS_CURSES:
+        parser.error("--tui requires the 'curses' module "
+                     "(install 'windows-curses' on Windows)")
+
+    if args.tui and args.quiet:
+        parser.error("Cannot use --tui with --quiet")
+
+    # Parse IRK
     irk = None
     if args.irk:
         try:
@@ -508,13 +770,20 @@ def main():
         except ValueError as e:
             parser.error(str(e))
 
-    # Default timeout: infinite for IRK mode, 30s otherwise
+    # Default timeout
     if args.timeout is not None:
         timeout = args.timeout
     elif args.irk:
         timeout = float('inf')
     else:
         timeout = 30.0
+
+    # Parse adapters
+    adapters = None
+    if args.adapters:
+        adapters = [a.strip() for a in args.adapters.split(",") if a.strip()]
+        if not adapters:
+            parser.error("--adapters requires at least one adapter name")
 
     target = args.mac if not args.all and not args.irk else None
     scanner = BLEScanner(
@@ -526,21 +795,26 @@ def main():
         min_rssi=args.min_rssi,
         rssi_window=args.rssi_window,
         active=args.active,
+        environment=args.environment,
+        alert_within=args.alert_within,
+        log_file=args.log,
+        tui=args.tui,
+        adapters=adapters,
     )
 
     def handle_signal(*_):
-        print("\nStopping scan...")
+        if not args.tui:
+            print("\nStopping scan...")
         scanner.stop()
 
     signal.signal(signal.SIGINT, handle_signal)
-    # SIGTERM is not reliably catchable on Windows, but harmless to register
     if platform.system() != "Windows":
         signal.signal(signal.SIGTERM, handle_signal)
 
     try:
         asyncio.run(scanner.scan())
     except KeyboardInterrupt:
-        pass  # fallback if signal handler didn't fire (Windows edge case)
+        pass
 
 
 if __name__ == "__main__":
