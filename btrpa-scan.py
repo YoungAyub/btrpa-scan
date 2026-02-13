@@ -60,6 +60,17 @@ _FIELDNAMES = [
     "est_distance", "manufacturer_data", "service_uuids", "resolved",
 ]
 
+_BANNER = r"""
+  _     _
+ | |__ | |_ _ __ _ __   __ _       ___  ___ __ _ _ __
+ | '_ \| __| '__| '_ \ / _` |_____/ __|/ __/ _` | '_ \
+ | |_) | |_| |  | |_) | (_| |_____\__ \ (_| (_| | | | |
+ |_.__/ \__|_|  | .__/ \__,_|     |___/\___\__,_|_| |_|
+                |_|
+   BLE Scanner with RPA Resolution
+   by @HackingDave | TrustedSec
+"""
+
 
 class BLEScanner:
     def __init__(self, target_mac: Optional[str], timeout: float,
@@ -471,6 +482,7 @@ class BLEScanner:
 
     def _print_header(self):
         """Print scan configuration banner."""
+        print(_BANNER)
         if self.irk_mode:
             print("Mode: IRK RESOLUTION — resolving RPAs against provided IRK")
             print(f"  IRK: {self.irk.hex()}")
