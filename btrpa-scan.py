@@ -761,6 +761,7 @@ def main():
     if args.mac and args.all:
         parser.error("Cannot use --all with a specific MAC address")
     if not args.mac and not args.all and not args.irk:
+        print(_BANNER)
         parser.print_help()
         sys.exit(0)
 
