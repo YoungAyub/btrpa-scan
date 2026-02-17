@@ -101,6 +101,585 @@ _BANNER = r"""
    by @HackingDave | TrustedSec
 """
 
+_GUI_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BTRPA-SCAN</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0a0a0a;--card:#1a1a1a;--border:#333;--text:#e0e0e0;
+  --green:#00ff41;--cyan:#00e5ff;--yellow:#ffff00;--red:#ff4444;--dim:#666;
+}
+html,body{height:100%;background:var(--bg);color:var(--text);
+  font-family:'Fira Code',Consolas,'Courier New',monospace;font-size:13px;
+  overflow-x:hidden}
+a{color:var(--cyan)}
+
+/* ── header bar ────────────────────────────────────────────── */
+#header{display:flex;align-items:center;gap:18px;padding:8px 16px;
+  background:#111;border-bottom:1px solid var(--border);flex-wrap:wrap}
+#header .title{color:var(--green);font-weight:700;font-size:16px;letter-spacing:1px}
+#header .stat{color:var(--text);font-size:12px}
+#header .stat b{color:var(--green)}
+#header .meta{font-size:11px;color:var(--dim);width:100%}
+
+/* ── main panels ───────────────────────────────────────────── */
+#panels{display:flex;height:calc(55vh - 50px);min-height:300px;
+  border-bottom:1px solid var(--border)}
+#radar-wrap{flex:3;position:relative;background:var(--card);
+  border-right:1px solid var(--border);min-width:0}
+#radar-canvas{width:100%;height:100%;display:block}
+#map-wrap{flex:2;position:relative;min-width:0}
+#map-wrap.hidden{display:none}
+#map-wrap.hidden ~ #radar-wrap,
+#radar-wrap.full{flex:1}
+#map{width:100%;height:100%}
+
+/* ── device table ──────────────────────────────────────────── */
+#table-wrap{flex:1;overflow:auto;background:var(--bg);padding:4px 0}
+#dev-table{width:100%;border-collapse:collapse}
+#dev-table th{position:sticky;top:0;background:#111;color:var(--green);
+  padding:6px 10px;text-align:left;cursor:pointer;user-select:none;
+  border-bottom:1px solid var(--border);font-size:11px;white-space:nowrap}
+#dev-table th:hover{color:var(--cyan)}
+#dev-table td{padding:5px 10px;border-bottom:1px solid #1e1e1e;
+  white-space:nowrap;font-size:12px}
+#dev-table tr:hover td{background:#222}
+#dev-table tr.highlight td{background:#1a2a1a}
+
+/* ── tooltip ───────────────────────────────────────────────── */
+#tooltip{position:fixed;pointer-events:none;background:rgba(10,10,10,.94);
+  border:1px solid var(--green);border-radius:4px;padding:10px 14px;
+  font-size:11px;line-height:1.6;max-width:380px;z-index:9999;display:none;
+  box-shadow:0 4px 20px rgba(0,255,65,.12)}
+#tooltip .lbl{color:var(--dim)}
+#tooltip .val{color:var(--text)}
+
+/* ── scan-complete overlay ─────────────────────────────────── */
+#overlay{position:fixed;inset:0;background:rgba(0,0,0,.82);display:none;
+  justify-content:center;align-items:center;z-index:10000;
+  animation:fadeIn .6s ease}
+#overlay .card{background:var(--card);border:1px solid var(--green);
+  border-radius:8px;padding:36px 48px;text-align:center;
+  box-shadow:0 0 40px rgba(0,255,65,.15)}
+#overlay h2{color:var(--green);font-size:22px;margin-bottom:12px}
+#overlay p{font-size:14px;margin:4px 0;color:var(--text)}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+
+/* leaflet popup override */
+.leaflet-popup-content-wrapper{background:var(--card)!important;
+  color:var(--text)!important;border-radius:4px!important;font-size:12px}
+.leaflet-popup-tip{background:var(--card)!important}
+</style>
+</head>
+<body>
+
+<!-- header -->
+<div id="header">
+  <span class="title">BTRPA-SCAN</span>
+  <span class="stat" id="s-dot" style="color:var(--green)">&bull;</span>
+  <span class="stat"><b id="s-unique">0</b> devices</span>
+  <span class="stat"><b id="s-total">0</b> detections</span>
+  <span class="stat"><b id="s-elapsed">00:00</b> elapsed</span>
+  <div class="meta" id="s-meta"></div>
+</div>
+
+<!-- radar + map -->
+<div id="panels">
+  <div id="radar-wrap" class="full">
+    <canvas id="radar-canvas"></canvas>
+  </div>
+  <div id="map-wrap" class="hidden">
+    <div id="map"></div>
+  </div>
+</div>
+
+<!-- device table -->
+<div id="table-wrap">
+<table id="dev-table">
+  <thead><tr>
+    <th data-col="address">Address</th>
+    <th data-col="name">Name</th>
+    <th data-col="rssi">RSSI</th>
+    <th data-col="avg_rssi">Avg</th>
+    <th data-col="est_distance">Distance</th>
+    <th data-col="times_seen">Seen</th>
+    <th data-col="last_seen">Last Seen</th>
+  </tr></thead>
+  <tbody id="dev-tbody"></tbody>
+</table>
+</div>
+
+<!-- tooltip -->
+<div id="tooltip"></div>
+
+<!-- scan complete overlay -->
+<div id="overlay">
+  <div class="card">
+    <h2>SCAN COMPLETE</h2>
+    <p id="ov-elapsed"></p>
+    <p id="ov-total"></p>
+    <p id="ov-unique"></p>
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
+<!-- inject Jinja2 port variable before raw block -->
+<script>var WSPORT = {{ port }};</script>
+""" + r"""{% raw %}""" + r"""
+<script>
+(function(){
+"use strict";
+
+/* ================================================================
+   State
+   ================================================================ */
+var devices = {};          // address -> device obj
+var scannerGPS = null;     // {lat,lon,alt}
+var hasGPS = false;
+var sortCol = "rssi";
+var sortAsc = false;
+var hoveredAddr = null;
+
+/* ================================================================
+   Radar
+   ================================================================ */
+var rCanvas = document.getElementById("radar-canvas");
+var rCtx    = rCanvas.getContext("2d");
+var sweepAngle = 0;
+var SWEEP_PERIOD = 4000; // ms per revolution
+var RINGS = [1, 5, 10, 20]; // metres
+var MAX_RING = 20;
+
+function resizeCanvas(){
+  var wrap = document.getElementById("radar-wrap");
+  rCanvas.width  = wrap.clientWidth  * (window.devicePixelRatio||1);
+  rCanvas.height = wrap.clientHeight * (window.devicePixelRatio||1);
+  rCanvas.style.width  = wrap.clientWidth  + "px";
+  rCanvas.style.height = wrap.clientHeight + "px";
+}
+window.addEventListener("resize", resizeCanvas);
+resizeCanvas();
+
+function hashAddr(addr){
+  var h=0;
+  for(var i=0;i<addr.length;i++){h=((h<<5)-h)+addr.charCodeAt(i);h|=0;}
+  return Math.abs(h);
+}
+
+function distToRadius(d, maxR){
+  if(d==null||d===""||d<=0) return maxR*0.85;
+  // log scale: 0m->0, 1m->ring1, 20m->maxR
+  var clamped = Math.min(d, MAX_RING);
+  return (Math.log(clamped+1)/Math.log(MAX_RING+1))*maxR;
+}
+
+function dotColor(d){
+  if(d==null||d===""||d<=0) return "#666666";
+  if(d<5)  return "#00ff41";
+  if(d<=15) return "#ffff00";
+  return "#ff4444";
+}
+
+function drawRadar(ts){
+  var dpr = window.devicePixelRatio||1;
+  var W = rCanvas.width, H = rCanvas.height;
+  var cx = W/2, cy = H/2;
+  var maxR = Math.min(cx, cy)*0.9;
+
+  rCtx.clearRect(0,0,W,H);
+
+  // rings
+  for(var ri=0;ri<RINGS.length;ri++){
+    var r = (Math.log(RINGS[ri]+1)/Math.log(MAX_RING+1))*maxR;
+    rCtx.beginPath();
+    rCtx.arc(cx,cy,r,0,Math.PI*2);
+    rCtx.strokeStyle = "rgba(0,255,65,0.15)";
+    rCtx.lineWidth = 1*dpr;
+    rCtx.stroke();
+    rCtx.fillStyle = "rgba(0,255,65,0.35)";
+    rCtx.font = (10*dpr)+"px monospace";
+    rCtx.fillText(RINGS[ri]+"m", cx+r+4*dpr, cy-4*dpr);
+  }
+
+  // sweep
+  sweepAngle = ((ts % SWEEP_PERIOD)/SWEEP_PERIOD)*Math.PI*2;
+  // trail gradient
+  var trailLen = Math.PI*0.4;
+  var grad = rCtx.createConicGradient(sweepAngle - trailLen, cx, cy);
+  grad.addColorStop(0, "rgba(0,255,65,0)");
+  grad.addColorStop(0.8, "rgba(0,255,65,0.07)");
+  grad.addColorStop(1, "rgba(0,255,65,0.18)");
+  rCtx.beginPath();
+  rCtx.moveTo(cx,cy);
+  rCtx.arc(cx,cy,maxR, sweepAngle-trailLen, sweepAngle);
+  rCtx.closePath();
+  rCtx.fillStyle = grad;
+  rCtx.fill();
+
+  // sweep line
+  rCtx.beginPath();
+  rCtx.moveTo(cx,cy);
+  rCtx.lineTo(cx+Math.cos(sweepAngle)*maxR, cy+Math.sin(sweepAngle)*maxR);
+  rCtx.strokeStyle = "rgba(0,255,65,0.7)";
+  rCtx.lineWidth = 2*dpr;
+  rCtx.stroke();
+
+  // centre
+  rCtx.fillStyle = "#00ff41";
+  rCtx.beginPath();
+  rCtx.arc(cx,cy,3*dpr,0,Math.PI*2);
+  rCtx.fill();
+  rCtx.font = "bold "+(10*dpr)+"px monospace";
+  rCtx.fillText("YOU",cx+6*dpr,cy+4*dpr);
+
+  // device dots
+  var now = Date.now();
+  var addrs = Object.keys(devices);
+  for(var i=0;i<addrs.length;i++){
+    var dev = devices[addrs[i]];
+    var angle = (hashAddr(dev.address)%3600)/3600*Math.PI*2;
+    var dist = dev.est_distance;
+    var r2 = distToRadius(dist, maxR);
+    var dx = cx + Math.cos(angle)*r2;
+    var dy = cy + Math.sin(angle)*r2;
+    dev._rx = dx; dev._ry = dy; // store for hit-test
+
+    var col = dotColor(dist);
+    var baseSize = 4*dpr;
+    // pulse on recent update (last 1.5s)
+    var age = now - (dev._updateTs||0);
+    var pulse = age < 1500 ? 1 + 0.6*(1 - age/1500) : 1;
+    // highlight on hover
+    if(hoveredAddr === dev.address) pulse = Math.max(pulse, 1.6);
+    var sz = baseSize * pulse;
+
+    // glow
+    rCtx.beginPath();
+    rCtx.arc(dx,dy,sz+3*dpr,0,Math.PI*2);
+    rCtx.fillStyle = col.replace(")", ",0.15)").replace("rgb","rgba");
+    if(col.charAt(0)==="#"){
+      var gc = hexToRgba(col,0.15);
+      rCtx.fillStyle = gc;
+    }
+    rCtx.fill();
+
+    rCtx.beginPath();
+    rCtx.arc(dx,dy,sz,0,Math.PI*2);
+    rCtx.fillStyle = col;
+    rCtx.fill();
+
+    // label near dot
+    if(pulse > 1.3 || hoveredAddr === dev.address){
+      rCtx.fillStyle = "#e0e0e0";
+      rCtx.font = (9*dpr)+"px monospace";
+      var lbl = dev.name && dev.name !== "Unknown" ? dev.name.substring(0,14) : dev.address.substring(0,8);
+      rCtx.fillText(lbl, dx+sz+4*dpr, dy+3*dpr);
+    }
+  }
+
+  requestAnimationFrame(drawRadar);
+}
+
+function hexToRgba(hex, a){
+  var r=parseInt(hex.slice(1,3),16), g=parseInt(hex.slice(3,5),16), b=parseInt(hex.slice(5,7),16);
+  return "rgba("+r+","+g+","+b+","+a+")";
+}
+
+requestAnimationFrame(drawRadar);
+
+/* ── radar hit test for tooltip ─────────────────────────── */
+rCanvas.addEventListener("mousemove", function(e){
+  var rect = rCanvas.getBoundingClientRect();
+  var dpr = window.devicePixelRatio||1;
+  var mx = (e.clientX - rect.left)*dpr;
+  var my = (e.clientY - rect.top)*dpr;
+  var hit = null;
+  var addrs = Object.keys(devices);
+  for(var i=0;i<addrs.length;i++){
+    var d = devices[addrs[i]];
+    if(d._rx===undefined) continue;
+    var dx=d._rx-mx, dy=d._ry-my;
+    if(Math.sqrt(dx*dx+dy*dy) < 12*dpr){ hit=d; break; }
+  }
+  if(hit){
+    hoveredAddr = hit.address;
+    showTooltip(hit, e.clientX, e.clientY);
+  } else {
+    hoveredAddr = null;
+    hideTooltip();
+  }
+});
+rCanvas.addEventListener("mouseleave", function(){
+  hoveredAddr = null;
+  hideTooltip();
+});
+
+/* ================================================================
+   Leaflet Map
+   ================================================================ */
+var map = null;
+var scannerMarker = null;
+var devMarkers = {};
+
+function initMap(){
+  if(map) return;
+  map = L.map("map",{zoomControl:true}).setView([0,0],16);
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",{
+    attribution:'&copy; OpenStreetMap',maxZoom:19
+  }).addTo(map);
+}
+
+function updateScannerPos(lat, lon){
+  if(!map) initMap();
+  var ll = [lat,lon];
+  if(!scannerMarker){
+    scannerMarker = L.circleMarker(ll,{radius:8,color:"#2196f3",
+      fillColor:"#2196f3",fillOpacity:0.7,weight:2}).addTo(map);
+    scannerMarker.bindPopup("Scanner position");
+    map.setView(ll, 17);
+  } else {
+    scannerMarker.setLatLng(ll);
+    map.setView(ll);
+  }
+}
+
+function updateDevMarker(dev){
+  var gps = dev.best_gps;
+  if(!gps || !gps.lat || !gps.lon) return;
+  if(!map) initMap();
+  var ll = [gps.lat, gps.lon];
+  var col = dotColor(dev.est_distance);
+  if(devMarkers[dev.address]){
+    devMarkers[dev.address].setLatLng(ll);
+    devMarkers[dev.address].setStyle({color:col,fillColor:col});
+  } else {
+    var m = L.circleMarker(ll,{radius:6,color:col,fillColor:col,
+      fillOpacity:0.8,weight:1}).addTo(map);
+    m.bindPopup("<b>"+(dev.name||"Unknown")+"</b><br>"+dev.address);
+    devMarkers[dev.address] = m;
+  }
+}
+
+function showMap(){
+  var mw = document.getElementById("map-wrap");
+  if(!mw.classList.contains("hidden")) return;
+  mw.classList.remove("hidden");
+  document.getElementById("radar-wrap").classList.remove("full");
+  resizeCanvas();
+  if(map) setTimeout(function(){ map.invalidateSize(); },100);
+}
+
+/* ================================================================
+   Device Table
+   ================================================================ */
+var tbody = document.getElementById("dev-tbody");
+var rowMap = {};
+
+function updateTable(){
+  var list = Object.values(devices);
+  list.sort(function(a,b){
+    var va = a[sortCol], vb = b[sortCol];
+    if(va==null||va==="") va = sortAsc ? Infinity : -Infinity;
+    if(vb==null||vb==="") vb = sortAsc ? Infinity : -Infinity;
+    if(typeof va === "string") return sortAsc ? va.localeCompare(vb) : vb.localeCompare(va);
+    return sortAsc ? va-vb : vb-va;
+  });
+  for(var i=0;i<list.length;i++){
+    var d = list[i];
+    var tr = rowMap[d.address];
+    if(!tr){
+      tr = document.createElement("tr");
+      tr.setAttribute("data-addr", d.address);
+      for(var c=0;c<7;c++) tr.appendChild(document.createElement("td"));
+      tr.addEventListener("mouseenter", (function(addr){
+        return function(){ hoveredAddr=addr; showTooltipForAddr(addr); };
+      })(d.address));
+      tr.addEventListener("mousemove", function(e){
+        var tip=document.getElementById("tooltip");
+        positionTooltip(tip,e.clientX,e.clientY);
+      });
+      tr.addEventListener("mouseleave", function(){
+        hoveredAddr=null; hideTooltip();
+      });
+      rowMap[d.address] = tr;
+    }
+    var cells = tr.children;
+    cells[0].textContent = d.address;
+    cells[1].textContent = d.name||"Unknown";
+    cells[2].textContent = d.rssi!=null ? d.rssi+" dBm" : "";
+    cells[3].textContent = d.avg_rssi!=null ? d.avg_rssi+" dBm" : "";
+    cells[4].textContent = (d.est_distance!=null&&d.est_distance!=="") ? "~"+Number(d.est_distance).toFixed(1)+"m" : "";
+    cells[5].textContent = d.times_seen ? d.times_seen+"x" : "";
+    cells[6].textContent = d.last_seen||"";
+    // ensure row is in DOM at correct position
+    if(tr.parentNode !== tbody){
+      tbody.appendChild(tr);
+    }
+  }
+  // reorder rows
+  for(var j=0;j<list.length;j++){
+    var row = rowMap[list[j].address];
+    tbody.appendChild(row);
+  }
+}
+
+// sortable columns
+document.querySelectorAll("#dev-table th").forEach(function(th){
+  th.addEventListener("click", function(){
+    var col = th.getAttribute("data-col");
+    if(sortCol===col) sortAsc=!sortAsc;
+    else { sortCol=col; sortAsc=false; }
+    updateTable();
+  });
+});
+
+/* ================================================================
+   Tooltip
+   ================================================================ */
+function showTooltip(dev, x, y){
+  var tip = document.getElementById("tooltip");
+  var html = "";
+  html += '<span class="lbl">Address:</span> <span class="val">'+esc(dev.address)+'</span><br>';
+  html += '<span class="lbl">Name:</span> <span class="val">'+esc(dev.name||"Unknown")+'</span><br>';
+  html += '<span class="lbl">RSSI:</span> <span class="val">'+(dev.rssi!=null?dev.rssi+" dBm":"N/A");
+  if(dev.avg_rssi!=null) html += ' (avg: '+dev.avg_rssi+' dBm)';
+  html += '</span><br>';
+  html += '<span class="lbl">TX Power:</span> <span class="val">'+(dev.tx_power!=null?dev.tx_power+' dBm':'N/A')+'</span><br>';
+  html += '<span class="lbl">Distance:</span> <span class="val">'+((dev.est_distance!=null&&dev.est_distance!=="")?"~"+Number(dev.est_distance).toFixed(1)+" m":"Unknown")+'</span><br>';
+  if(dev.best_gps && dev.best_gps.lat){
+    html += '<span class="lbl">Best GPS:</span> <span class="val">'+dev.best_gps.lat.toFixed(6)+', '+dev.best_gps.lon.toFixed(6)+'</span><br>';
+  }
+  if(dev.manufacturer_data){
+    html += '<span class="lbl">Mfr Data:</span> <span class="val">'+esc(dev.manufacturer_data)+'</span><br>';
+  }
+  if(dev.service_uuids){
+    html += '<span class="lbl">Services:</span> <span class="val">'+esc(dev.service_uuids)+'</span><br>';
+  }
+  html += '<span class="lbl">Seen:</span> <span class="val">'+(dev.times_seen||0)+'x</span>';
+  if(dev.resolved===true) html += '<br><span class="val" style="color:var(--green)">IRK RESOLVED</span>';
+  tip.innerHTML = html;
+  tip.style.display = "block";
+  positionTooltip(tip, x, y);
+}
+
+function showTooltipForAddr(addr){
+  var d = devices[addr];
+  if(!d) return;
+  var tr = rowMap[addr];
+  if(!tr) return;
+  var rect = tr.getBoundingClientRect();
+  showTooltip(d, rect.right+10, rect.top);
+}
+
+function positionTooltip(tip, x, y){
+  var tw = tip.offsetWidth, th2 = tip.offsetHeight;
+  var wx = window.innerWidth, wy = window.innerHeight;
+  var lx = x+14, ly = y+14;
+  if(lx+tw > wx-8) lx = x - tw - 14;
+  if(ly+th2 > wy-8) ly = y - th2 - 14;
+  if(lx<4) lx=4; if(ly<4) ly=4;
+  tip.style.left = lx+"px";
+  tip.style.top  = ly+"px";
+}
+
+function hideTooltip(){
+  document.getElementById("tooltip").style.display="none";
+}
+
+function esc(s){ if(!s) return ""; var d=document.createElement("div"); d.textContent=s; return d.innerHTML; }
+
+/* ================================================================
+   Header / Status
+   ================================================================ */
+function updateStatus(data){
+  if(data.unique_count!=null) document.getElementById("s-unique").textContent = data.unique_count;
+  if(data.total_detections!=null) document.getElementById("s-total").textContent = data.total_detections;
+  if(data.elapsed!=null){
+    var m = Math.floor(data.elapsed/60), s = Math.floor(data.elapsed%60);
+    document.getElementById("s-elapsed").textContent = (m<10?"0":"")+m+":"+(s<10?"0":"")+s;
+  }
+  var dot = document.getElementById("s-dot");
+  if(data.scanning===false){ dot.style.color="var(--red)"; }
+  else { dot.style.color="var(--green)"; }
+}
+
+/* ================================================================
+   Scan complete overlay
+   ================================================================ */
+function showOverlay(data){
+  var el = document.getElementById("overlay");
+  document.getElementById("ov-elapsed").textContent = "Elapsed: "+Number(data.elapsed).toFixed(1)+"s";
+  document.getElementById("ov-total").textContent = "Total detections: "+(data.total_detections||0);
+  document.getElementById("ov-unique").textContent = "Unique devices: "+(data.unique_devices||0);
+  el.style.display = "flex";
+}
+
+/* ================================================================
+   Socket.IO
+   ================================================================ */
+var socket = io("http://"+window.location.hostname+":"+WSPORT, {transports:["websocket","polling"]});
+
+socket.on("connect", function(){
+  // fetch full state on connect
+  fetch("/api/state").then(function(r){return r.json();}).then(function(state){
+    if(state.devices){
+      var addrs = Object.keys(state.devices);
+      for(var i=0;i<addrs.length;i++){
+        var d = state.devices[addrs[i]];
+        d._updateTs = Date.now();
+        devices[d.address] = d;
+        updateDevMarker(d);
+      }
+      updateTable();
+    }
+    if(state.status) updateStatus(state.status);
+    if(state.gps && state.gps.lat!=null){
+      hasGPS = true;
+      scannerGPS = state.gps;
+      showMap();
+      updateScannerPos(state.gps.lat, state.gps.lon);
+    }
+  }).catch(function(){});
+});
+
+socket.on("device_update", function(d){
+  d._updateTs = Date.now();
+  devices[d.address] = d;
+  updateDevMarker(d);
+  updateTable();
+});
+
+socket.on("gps_update", function(g){
+  if(g && g.lat!=null && g.lon!=null){
+    scannerGPS = g;
+    if(!hasGPS){ hasGPS=true; showMap(); }
+    updateScannerPos(g.lat, g.lon);
+  }
+});
+
+socket.on("scan_status", function(data){
+  updateStatus(data);
+});
+
+socket.on("scan_complete", function(data){
+  updateStatus({scanning:false, elapsed:data.elapsed,
+    total_detections:data.total_detections, unique_count:data.unique_devices});
+  showOverlay(data);
+});
+
+})();
+</script>
+""" + r"""{% endraw %}""" + r"""
+</body>
+</html>
+"""
+
 
 def _timestamp() -> str:
     """Return an ISO 8601 timestamp with timezone offset."""
